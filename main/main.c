@@ -170,7 +170,7 @@ static void motor_hw_right(const char *speed)
 }
 
 static void motor_hw_stop(void)
-{
+{  
     ESP_LOGI(TAG, "Motor stop");
     // Add PWM/ESC code here.
 }
