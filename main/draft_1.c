@@ -14,10 +14,8 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
-#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
-#include "esp_heap_caps.h"
 #include "mqtt_client.h"
 #include "nvs_flash.h"
 #include "cJSON.h"
@@ -28,7 +26,7 @@
 // Set Wi-Fi and MQTT here.
 #define WIFI_SSID           "HUAWEI-B2368-759429_NOMAP"
 #define WIFI_PASS           "92275499ax8f2002"
-#define MQTT_BROKER_URI     "mqtt://192.168.1.54:1883"
+#define MQTT_BROKER_URI     "mqtt://192.168.1.55:1883"
 #define BOAT_ID             "boat1"
 
 #define WIFI_MAXIMUM_RETRY  5
@@ -56,6 +54,7 @@
 #define DS18B20_GPIO        GPIO_NUM_4
 #define DS18B20_RESOLUTION  DS18B20_RESOLUTION_12B
 
+// DHT11 Configuration
 #define DHT11_GPIO          GPIO_NUM_5
 
 // Motor Control Pins
@@ -123,12 +122,7 @@ typedef struct {
 
 static sensor_data_t g_sensor_data = {0};
 
-static void log_heap_status(const char *stage)
-{
-    uint32_t free_heap = esp_get_free_heap_size();
-    size_t free_8bit = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    ESP_LOGI(TAG, "[%s] Free heap=%u bytes (8-bit=%u bytes)", stage, (unsigned)free_heap, (unsigned)free_8bit);
-}
+sensor_sample_t sample = {0};
 
 static int64_t now_ms(void)
 {
@@ -401,13 +395,21 @@ static void publish_sensors_task(void *arg)
             continue;
         }
 
-        sensor_data_t snapshot = {0};
+        /* Copy latest sensor values under mutex protection */
         if (xSensorMutex && xSemaphoreTake(xSensorMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            snapshot = g_sensor_data;
+            sample.temp_c = g_sensor_data.ds18b20_temp;
+            sample.humidity = g_sensor_data.dht11_humidity;
+            /* g_sensor_data does not contain a battery field, use placeholder 0.0f */
+            sample.battery_v = 0.0f;
+            sample.valid = (g_sensor_data.ds18b20_valid && g_sensor_data.dht11_valid);
             xSemaphoreGive(xSensorMutex);
+        } else {
+            /* On mutex timeout or missing mutex, mark sample invalid */
+            sample.temp_c = 0.0f;
+            sample.humidity = 0.0f;
+            sample.battery_v = 0.0f;
+            sample.valid = false;
         }
-
-        bool any_valid = snapshot.ds18b20_valid || snapshot.dht11_valid;
 
         cJSON *root = cJSON_CreateObject();
         if (!root) {
@@ -415,13 +417,12 @@ static void publish_sensors_task(void *arg)
             continue;
         }
 
-        cJSON_AddNumberToObject(root, "temp_c", snapshot.ds18b20_temp);
-        //cJSON_AddNumberToObject(root, "ds18b20_temp_c", snapshot.ds18b20_temp);
-        //cJSON_AddBoolToObject(root, "ds18b20_valid", snapshot.ds18b20_valid);
-        //cJSON_AddNumberToObject(root, "dht_temp_c", snapshot.dht11_temp);
-        cJSON_AddNumberToObject(root, "humidity", snapshot.dht11_humidity);
-        //cJSON_AddBoolToObject(root, "dht_valid", snapshot.dht11_valid);
-        cJSON_AddBoolToObject(root, "valid", any_valid);
+        cJSON_AddNumberToObject(root, "temp_c", sample.temp_c);
+        //cJSON_AddNumberToObject(root, "temperature", sample.temp_c);
+        cJSON_AddNumberToObject(root, "humidity", sample.humidity);
+        cJSON_AddNumberToObject(root, "battery_v", sample.battery_v);
+        //cJSON_AddNumberToObject(root, "voltage", sample.battery_v);
+        cJSON_AddBoolToObject(root, "valid", sample.valid);
         cJSON_AddNumberToObject(root, "timestamp", (double)now_ms());
 
         mqtt_publish_json(s_topic_sensors, root);
@@ -596,11 +597,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     (void)arg;
     (void)event_data;
 
-    if (!s_event_group) {
-        ESP_LOGE(TAG_WIFI, "Event group is NULL in wifi_event_handler");
-        return;
-    }
-
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
         return;
@@ -615,10 +611,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         }
         xEventGroupClearBits(s_event_group, WIFI_CONNECTED_BIT);
         ESP_LOGW(TAG, "Wi-Fi disconnected");
-        if (xSensorMutex && xSemaphoreTake(xSensorMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            g_sensor_data.wifi_connected = false;
-            xSemaphoreGive(xSensorMutex);
-        }
         return;
     }
 
@@ -627,11 +619,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         xEventGroupSetBits(s_event_group, WIFI_CONNECTED_BIT);
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Wi-Fi got IP " IPSTR, IP2STR(&event->ip_info.ip));
-        if (xSensorMutex && xSemaphoreTake(xSensorMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            g_sensor_data.wifi_connected = true;
-            snprintf(g_sensor_data.ip_address, sizeof(g_sensor_data.ip_address), IPSTR, IP2STR(&event->ip_info.ip));
-            xSemaphoreGive(xSensorMutex);
-        }
         return;
     }
 }
@@ -882,20 +869,14 @@ void task_dht11(void *pvParameters)
 
 void app_main(void)
 {
-    log_heap_status("startup");
-
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-
-    s_event_group = xEventGroupCreate();
-    if (!s_event_group) {
-        ESP_LOGE(TAG_MAIN, "Event group create failed (heap=%u)", (unsigned)esp_get_free_heap_size());
-        return;
-    }
+    init_topics();
+    wifi_init_sta();
 
     /* Create mutex for protecting shared sensor data */
     xSensorMutex = xSemaphoreCreateMutex();
@@ -903,12 +884,13 @@ void app_main(void)
         ESP_LOGE(TAG_MAIN, "Failed to create sensor mutex");
         return;
     }
+    if (!s_event_group) {
+        ESP_LOGE(TAG, "Event group create failed");
+        return;
+    }
 
     init_topics();
-
-    log_heap_status("pre-wifi");
     wifi_init_sta();
-    log_heap_status("post-wifi");
 
     // Create Task 1: DS18B20 Temperature Reading
     // Task will handle missing sensor and attempt reinitialization
@@ -920,13 +902,13 @@ void app_main(void)
         DS18B20_TASK_PRIORITY,
         NULL
     );
-
+    
     if (task_created != pdPASS) {
         ESP_LOGE(TAG_MAIN, "Failed to create DS18B20 task!");
     } else {
-        ESP_LOGI(TAG_MAIN, "DS18B20 task created");
+        ESP_LOGI(TAG_MAIN, "✓ DS18B20 task created");
     }
-
+    
     // Create Task 2: DHT11 Temperature & Humidity Reading
     task_created = xTaskCreate(
         task_dht11,
@@ -936,14 +918,14 @@ void app_main(void)
         DHT11_TASK_PRIORITY,
         NULL
     );
-
+    
     if (task_created != pdPASS) {
         ESP_LOGE(TAG_MAIN, "Failed to create DHT11 task!");
     } else {
-        ESP_LOGI(TAG_MAIN, "DHT11 task created");
+        ESP_LOGI(TAG_MAIN, "✓ DHT11 task created");
     }
+    
 
-    log_heap_status("post-sensor-tasks");
     xTaskCreate(mqtt_start_task, "mqtt_start_task", 4096, NULL, 5, NULL);
     xTaskCreate(publish_sensors_task, "publish_sensors_task", 4096, NULL, 5, NULL);
     xTaskCreate(publish_gps_task, "publish_gps_task", 4096, NULL, 5, NULL);

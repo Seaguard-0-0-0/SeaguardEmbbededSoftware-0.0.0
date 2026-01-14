@@ -9,8 +9,8 @@ idf_component_register(
         esp_event
         nvs_flash
         mqtt
-        cjson
+        json
         onewire_bus
         ds18b20
-        esp-dht
+        dht
 )
