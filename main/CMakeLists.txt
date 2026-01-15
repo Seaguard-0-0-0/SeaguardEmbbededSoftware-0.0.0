@@ -1,8 +1,15 @@
 idf_component_register(
-    SRCS "main.c"
+    SRCS
+        "app_main.c"
+        "wifi_mgr.c"
+        "mqtt_mgr.c"
+        "sensors_mgr.c"
+        "sensor_data.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver
+        esp_adc
+        esp_hw_support
         esp_timer
         esp_wifi
         esp_netif
@@ -12,5 +19,5 @@ idf_component_register(
         cjson
         onewire_bus
         ds18b20
-        esp-dht
+        dht
 )
