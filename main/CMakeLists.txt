@@ -5,6 +5,8 @@ idf_component_register(
         "mqtt_mgr.c"
         "sensors_mgr.c"
         "sensor_data.c"
+        "rc_input.c"
+        "motor_out.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver
@@ -16,7 +18,7 @@ idf_component_register(
         esp_event
         nvs_flash
         mqtt
-        cjson
+        json
         onewire_bus
         ds18b20
         dht

@@ -16,6 +16,8 @@
 #include "mqtt_mgr.h"
 #include "sensors_mgr.h"
 #include "sensor_data.h"
+#include "rc_input.h"
+#include "motor_out.h"
 
 #define TOPIC_MAX_LEN 128
 
@@ -24,6 +26,11 @@ static const char *TAG = "APP_MAIN";
 static char s_topic_sensors[TOPIC_MAX_LEN];
 static char s_topic_ack[TOPIC_MAX_LEN];
 static char s_topic_control_prefix[TOPIC_MAX_LEN];
+static char s_topic_rc[TOPIC_MAX_LEN];
+
+#define RC_PUBLISH_INTERVAL_MS  200
+#define RC_PUBLISH_TIMEOUT_MS   200
+#define RC_PUBLISH_LOG_MS       1000
 
 static int64_t now_ms(void)
 {
@@ -48,6 +55,8 @@ static void init_topics(void)
                       "seaguard/%s/ack", BOAT_ID);
     ok &= build_topic(s_topic_control_prefix, sizeof(s_topic_control_prefix),
                       "seaguard/%s/control/", BOAT_ID);
+    ok &= build_topic(s_topic_rc, sizeof(s_topic_rc),
+                      "seaguard/%s/rc", BOAT_ID);
 
     if (!ok) {
         ESP_LOGE(TAG, "Topic build failed");
@@ -177,6 +186,69 @@ static void mqtt_send_ack(const char *cmd_id, const char *action, bool ok, const
 
     mqtt_publish_json(s_topic_ack, root);
     cJSON_Delete(root);
+}
+
+static bool rc_channel_recent(const rc_input_t *rc, size_t index, int64_t now_ms)
+{
+    if (!rc || index >= (sizeof(rc->ch_us) / sizeof(rc->ch_us[0]))) {
+        return false;
+    }
+    if (!rc->valid[index]) {
+        return false;
+    }
+    if (rc->last_update_ms[index] <= 0) {
+        return false;
+    }
+    return (now_ms - rc->last_update_ms[index]) <= RC_PUBLISH_TIMEOUT_MS;
+}
+
+static void publish_rc_task(void *arg)
+{
+    (void)arg;
+    const TickType_t delay = pdMS_TO_TICKS(RC_PUBLISH_INTERVAL_MS);
+    int64_t last_log_ms = 0;
+
+    for (;;) {
+        if (!mqtt_is_connected()) {
+            vTaskDelay(delay);
+            continue;
+        }
+
+        rc_input_t rc = {0};
+        rc_input_get_snapshot(&rc);
+
+        int64_t now = now_ms();
+        bool ch1_ok = rc_channel_recent(&rc, 0, now);
+        bool ch2_ok = rc_channel_recent(&rc, 1, now);
+        bool ch5_ok = rc_channel_recent(&rc, 4, now);
+
+        if (!(ch1_ok && ch2_ok && ch5_ok)) {
+            vTaskDelay(delay);
+            continue;
+        }
+
+        cJSON *root = cJSON_CreateObject();
+        if (!root) {
+            vTaskDelay(delay);
+            continue;
+        }
+
+        cJSON_AddNumberToObject(root, "ch1", rc.ch_us[0]);
+        cJSON_AddNumberToObject(root, "ch2", rc.ch_us[1]);
+        cJSON_AddNumberToObject(root, "ch5", rc.ch_us[4]);
+        cJSON_AddNumberToObject(root, "timestamp", (double)now);
+
+        mqtt_publish_json(s_topic_rc, root);
+        cJSON_Delete(root);
+
+        if (now - last_log_ms >= RC_PUBLISH_LOG_MS) {
+            last_log_ms = now;
+            ESP_LOGI(TAG, "RC publish ch1=%u ch2=%u ch5=%u topic=%s",
+                     rc.ch_us[0], rc.ch_us[1], rc.ch_us[4], s_topic_rc);
+        }
+
+        vTaskDelay(delay);
+    }
 }
 
 static const char *topic_action_from_control(const char *topic)
@@ -344,5 +416,11 @@ void app_main(void)
     sensors_init();
     sensors_start();
 
+    motor_out_init();
+    rc_input_init();
+    rc_input_start();
+    motor_out_start();
+
     xTaskCreate(publish_task, "publish_task", 4096, NULL, 5, NULL);
+    xTaskCreate(publish_rc_task, "publish_rc_task", 3072, NULL, 5, NULL);
 }

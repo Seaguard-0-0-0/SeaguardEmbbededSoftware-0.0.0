@@ -8,10 +8,13 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+
+#include "esp_chip_info.h"
 
 #include "driver/gpio.h"
-#include "driver/i2c.h"
-#include "esp_clk.h"
+#include "driver/i2c_master.h"
+#include "esp_private/esp_clk.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -41,7 +44,12 @@
 #define I2C_PORT            I2C_NUM_0
 #define I2C_SDA_GPIO        GPIO_NUM_21
 #define I2C_SCL_GPIO        GPIO_NUM_22
-#define I2C_FREQ_HZ         400000
+#define I2C_FREQ_HZ         100000
+#define I2C_FREQ_FALLBACK_HZ 100000
+#define I2C_TIMEOUT_MS      50
+#define I2C_POST_SCAN_DELAY_MS 20
+#define MPU_INIT_DELAY_MS   50
+#define I2C_RECOVER_PULSE_US 5
 
 // DS18B20 and DHT11 pins.
 #define DS18B20_GPIO        GPIO_NUM_4
@@ -69,8 +77,11 @@
 #define TASK_STACK_SIZE         4096
 
 // MPU6050 registers
-#define MPU6050_ADDR            0x68
+#define MPU6050_ADDR_DEFAULT    0x68
+#define MPU6050_ADDR_AD0_HIGH   0x69
 #define MPU6050_REG_PWR_MGMT_1  0x6B
+#define MPU6050_REG_WHO_AM_I    0x75
+#define MPU6050_REG_CONFIG      0x1A
 #define MPU6050_REG_ACCEL_XOUT  0x3B
 #define MPU6050_REG_GYRO_CONFIG 0x1B
 #define MPU6050_REG_ACCEL_CONFIG 0x1C
@@ -88,6 +99,14 @@ static onewire_bus_handle_t s_onewire_bus;
 static ds18b20_device_handle_t s_ds18b20_device;
 static bool s_mpu_ready;
 static int64_t s_mpu_last_init_ms;
+static bool s_mpu_present;
+static bool s_mpu_logged_first;
+static int s_mpu_fail_count;
+static uint8_t s_mpu_addr = MPU6050_ADDR_DEFAULT;
+static int s_i2c_freq_hz = I2C_FREQ_HZ;
+static i2c_master_bus_handle_t s_i2c_bus;
+static i2c_master_dev_handle_t s_mpu_dev;
+static SemaphoreHandle_t s_i2c_mutex;
 
 #if SOC_TEMP_SENSOR_SUPPORTED
 static temperature_sensor_handle_t s_temp_handle;
@@ -106,9 +125,67 @@ static int s_chip_model;
 static int s_chip_revision;
 static int s_chip_cores;
 
+static esp_err_t i2c_master_init_any(void);
+static bool mpu6050_init(void);
+static bool i2c_bus_recover(void);
+static void i2c_gpio_recover(void);
+static void i2c_log_lines(const char *stage);
+
 static int64_t now_ms(void)
 {
     return esp_timer_get_time() / 1000;
+}
+
+static void i2c_log_lines(const char *stage)
+{
+    int sda = gpio_get_level(I2C_SDA_GPIO);
+    int scl = gpio_get_level(I2C_SCL_GPIO);
+    ESP_LOGI(TAG, "I2C lines %s SDA=%d SCL=%d", stage ? stage : "", sda, scl);
+}
+
+static void i2c_gpio_recover(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << I2C_SDA_GPIO) | (1ULL << I2C_SCL_GPIO),
+        .mode = GPIO_MODE_INPUT_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+
+    gpio_set_level(I2C_SDA_GPIO, 1);
+    gpio_set_level(I2C_SCL_GPIO, 1);
+    esp_rom_delay_us(I2C_RECOVER_PULSE_US);
+
+    for (int i = 0; i < 9; i++) {
+        gpio_set_level(I2C_SCL_GPIO, 0);
+        esp_rom_delay_us(I2C_RECOVER_PULSE_US);
+        gpio_set_level(I2C_SCL_GPIO, 1);
+        esp_rom_delay_us(I2C_RECOVER_PULSE_US);
+    }
+
+    gpio_set_level(I2C_SDA_GPIO, 0);
+    esp_rom_delay_us(I2C_RECOVER_PULSE_US);
+    gpio_set_level(I2C_SCL_GPIO, 1);
+    esp_rom_delay_us(I2C_RECOVER_PULSE_US);
+    gpio_set_level(I2C_SDA_GPIO, 1);
+    esp_rom_delay_us(I2C_RECOVER_PULSE_US);
+}
+
+static bool i2c_lock(TickType_t timeout)
+{
+    if (!s_i2c_mutex) {
+        return false;
+    }
+    return xSemaphoreTake(s_i2c_mutex, timeout) == pdTRUE;
+}
+
+static void i2c_unlock(void)
+{
+    if (s_i2c_mutex) {
+        xSemaphoreGive(s_i2c_mutex);
+    }
 }
 
 static esp_err_t init_ds18b20(void)
@@ -273,53 +350,202 @@ static void ultrasonic_task(void *arg)
     }
 }
 
-static esp_err_t i2c_master_init(void)
+static void i2c_scan_bus(i2c_master_bus_handle_t bus)
 {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
+    bool found_any = false;
+    s_mpu_present = false;
+    s_mpu_addr = MPU6050_ADDR_DEFAULT;
+
+    for (uint8_t addr = 0x03; addr <= 0x77; addr++) {
+        if (!i2c_lock(pdMS_TO_TICKS(I2C_TIMEOUT_MS))) {
+            ESP_LOGW(TAG, "I2C scan lock timeout");
+            break;
+        }
+        esp_err_t err = i2c_master_probe(bus, addr, I2C_TIMEOUT_MS);
+        i2c_unlock();
+        if (err == ESP_OK) {
+            found_any = true;
+            ESP_LOGI(TAG, "I2C found device at 0x%02X", addr);
+            if (addr == MPU6050_ADDR_DEFAULT || addr == MPU6050_ADDR_AD0_HIGH) {
+                s_mpu_present = true;
+                s_mpu_addr = addr;
+            }
+        }
+    }
+
+    if (!found_any) {
+        ESP_LOGW(TAG, "I2C scan found no devices.");
+        ESP_LOGW(TAG, "Check SDA/SCL pins, pull-ups, power, and common GND.");
+        ESP_LOGW(TAG, "Check MPU6050 AD0 pin state (0x68/0x69).");
+    } else if (!s_mpu_present) {
+        ESP_LOGW(TAG, "I2C scan found devices, but not MPU6050 (0x68/0x69).");
+    } else {
+        ESP_LOGI(TAG, "MPU6050 detected at 0x%02X", s_mpu_addr);
+    }
+}
+
+static void i2c_bus_cleanup(void)
+{
+    if (s_mpu_dev) {
+        i2c_master_bus_rm_device(s_mpu_dev);
+        s_mpu_dev = NULL;
+    }
+    if (s_i2c_bus) {
+        i2c_del_master_bus(s_i2c_bus);
+        s_i2c_bus = NULL;
+    }
+}
+
+static bool i2c_bus_recover(void)
+{
+    ESP_LOGW(TAG, "I2C bus recover starting");
+    if (i2c_lock(pdMS_TO_TICKS(200))) {
+        i2c_log_lines("before recover");
+        i2c_gpio_recover();
+        i2c_log_lines("after recover");
+        i2c_unlock();
+    }
+    i2c_bus_cleanup();
+    esp_err_t err = i2c_master_init_any();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "I2C bus recover failed: %s", esp_err_to_name(err));
+        s_mpu_present = false;
+        return false;
+    }
+    s_mpu_ready = mpu6050_init();
+    if (!s_mpu_ready) {
+        ESP_LOGW(TAG, "MPU6050 init failed after bus recover");
+    }
+    return s_mpu_ready;
+}
+
+static esp_err_t i2c_master_init_with_freq(int freq_hz)
+{
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port = I2C_PORT,
         .sda_io_num = I2C_SDA_GPIO,
         .scl_io_num = I2C_SCL_GPIO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_FREQ_HZ,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-    esp_err_t err = i2c_param_config(I2C_PORT, &conf);
+
+    ESP_LOGI(TAG, "I2C init SDA=%d SCL=%d freq=%d",
+             I2C_SDA_GPIO, I2C_SCL_GPIO, freq_hz);
+    ESP_LOGI(TAG, "MPU6050 address configured: 0x%02X (AD0=%s)",
+             s_mpu_addr, s_mpu_addr == MPU6050_ADDR_AD0_HIGH ? "HIGH" : "LOW");
+    i2c_log_lines("before init");
+
+    esp_err_t err = i2c_new_master_bus(&bus_cfg, &s_i2c_bus);
     if (err != ESP_OK) {
         return err;
     }
-    return i2c_driver_install(I2C_PORT, conf.mode, 0, 0, 0);
+    i2c_log_lines("after init");
+
+    vTaskDelay(pdMS_TO_TICKS(I2C_POST_SCAN_DELAY_MS));
+    i2c_scan_bus(s_i2c_bus);
+    if (!s_mpu_present) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(I2C_POST_SCAN_DELAY_MS));
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = s_mpu_addr,
+        .scl_speed_hz = freq_hz,
+    };
+
+    err = i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_mpu_dev);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "I2C device handle added for 0x%02X", s_mpu_addr);
+    } else {
+        ESP_LOGE(TAG, "I2C device add failed: %s", esp_err_to_name(err));
+    }
+    return err;
 }
 
-static esp_err_t mpu6050_write(uint8_t reg, uint8_t value)
+static esp_err_t i2c_master_init_any(void)
+{
+    s_i2c_freq_hz = I2C_FREQ_HZ;
+    esp_err_t err = i2c_master_init_with_freq(s_i2c_freq_hz);
+    if (err == ESP_OK) {
+        return ESP_OK;
+    }
+
+    i2c_bus_cleanup();
+    s_i2c_freq_hz = I2C_FREQ_FALLBACK_HZ;
+    ESP_LOGW(TAG, "I2C init failed at %d Hz, retrying at %d Hz",
+             I2C_FREQ_HZ, I2C_FREQ_FALLBACK_HZ);
+    return i2c_master_init_with_freq(s_i2c_freq_hz);
+}
+
+static esp_err_t mpu_write_reg(uint8_t reg, uint8_t value)
 {
     uint8_t data[2] = {reg, value};
-    return i2c_master_write_to_device(I2C_PORT, MPU6050_ADDR,
-                                      data, sizeof(data), pdMS_TO_TICKS(100));
+    if (!s_mpu_dev) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!i2c_lock(pdMS_TO_TICKS(I2C_TIMEOUT_MS))) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = i2c_master_transmit(s_mpu_dev, data, sizeof(data), I2C_TIMEOUT_MS);
+    i2c_unlock();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "MPU write reg 0x%02X failed: %s", reg, esp_err_to_name(err));
+    }
+    return err;
 }
 
-static esp_err_t mpu6050_read(uint8_t reg, uint8_t *data, size_t len)
+static esp_err_t mpu_read_regs(uint8_t reg, uint8_t *data, size_t len)
 {
-    return i2c_master_write_read_device(I2C_PORT, MPU6050_ADDR,
-                                        &reg, 1, data, len, pdMS_TO_TICKS(100));
+    if (!s_mpu_dev) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!i2c_lock(pdMS_TO_TICKS(I2C_TIMEOUT_MS))) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = i2c_master_transmit_receive(s_mpu_dev, &reg, 1, data, len, I2C_TIMEOUT_MS);
+    i2c_unlock();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "MPU read reg 0x%02X failed: %s", reg, esp_err_to_name(err));
+    }
+    return err;
 }
 
 static bool mpu6050_init(void)
 {
-    if (mpu6050_write(MPU6050_REG_PWR_MGMT_1, 0x00) != ESP_OK) {
+    if (mpu_write_reg(MPU6050_REG_PWR_MGMT_1, 0x00) != ESP_OK) {
         return false;
     }
-    (void)mpu6050_write(MPU6050_REG_GYRO_CONFIG, 0x00);
-    (void)mpu6050_write(MPU6050_REG_ACCEL_CONFIG, 0x00);
+    vTaskDelay(pdMS_TO_TICKS(MPU_INIT_DELAY_MS));
+    (void)mpu_write_reg(MPU6050_REG_CONFIG, 0x03);
+    (void)mpu_write_reg(MPU6050_REG_GYRO_CONFIG, 0x00);
+    (void)mpu_write_reg(MPU6050_REG_ACCEL_CONFIG, 0x00);
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    uint8_t whoami = 0;
+    if (mpu_read_regs(MPU6050_REG_WHO_AM_I, &whoami, 1) == ESP_OK) {
+        ESP_LOGI(TAG, "MPU6050 WHO_AM_I=0x%02X", whoami);
+        if (whoami != MPU6050_ADDR_DEFAULT && whoami != MPU6050_ADDR_AD0_HIGH) {
+            ESP_LOGW(TAG, "MPU6050 WHO_AM_I unexpected: 0x%02X", whoami);
+            return false;
+        }
+    } else {
+        ESP_LOGW(TAG, "MPU6050 WHO_AM_I read failed");
+        return false;
+    }
+
     vTaskDelay(pdMS_TO_TICKS(20));
     return true;
 }
 
-static bool mpu6050_read_sample(float *ax, float *ay, float *az,
-                                float *gx, float *gy, float *gz, float *temp_c)
+static esp_err_t mpu6050_read_sample(float *ax, float *ay, float *az,
+                                     float *gx, float *gy, float *gz, float *temp_c)
 {
     uint8_t raw[14] = {0};
-    if (mpu6050_read(MPU6050_REG_ACCEL_XOUT, raw, sizeof(raw)) != ESP_OK) {
-        return false;
+    esp_err_t err = mpu_read_regs(MPU6050_REG_ACCEL_XOUT, raw, sizeof(raw));
+    if (err != ESP_OK) {
+        return err;
     }
 
     int16_t ax_raw = (int16_t)((raw[0] << 8) | raw[1]);
@@ -339,19 +565,23 @@ static bool mpu6050_read_sample(float *ax, float *ay, float *az,
     *gz = (float)gz_raw / 131.0f;
 
     *temp_c = ((float)temp_raw / 340.0f) + 36.53f;
-    return true;
+    return ESP_OK;
 }
 
 static void mpu6050_task(void *arg)
 {
     (void)arg;
     const TickType_t delay = pdMS_TO_TICKS(MPU_TASK_MS);
+    int64_t last_ok_log_ms = 0;
 
     for (;;) {
         int64_t now = now_ms();
         if (!s_mpu_ready && (now - s_mpu_last_init_ms) > 2000) {
             s_mpu_ready = mpu6050_init();
             s_mpu_last_init_ms = now;
+            if (!s_mpu_ready) {
+                ESP_LOGW(TAG, "MPU6050 init failed, retrying...");
+            }
         }
 
         bool ok = false;
@@ -360,9 +590,32 @@ static void mpu6050_task(void *arg)
         float temp_c = 0.0f;
 
         if (s_mpu_ready) {
-            ok = mpu6050_read_sample(&ax, &ay, &az, &gx, &gy, &gz, &temp_c);
+            esp_err_t err = mpu6050_read_sample(&ax, &ay, &az, &gx, &gy, &gz, &temp_c);
+            ok = (err == ESP_OK);
             if (!ok) {
                 s_mpu_ready = false;
+                s_mpu_fail_count++;
+                ESP_LOGW(TAG, "MPU6050 read failed: %s (fail_count=%d)",
+                         esp_err_to_name(err), s_mpu_fail_count);
+                int backoff_ms = (s_mpu_fail_count < 5) ? 200 : 1000;
+                vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+                if (s_mpu_fail_count >= 3) {
+                    s_mpu_fail_count = 0;
+                    i2c_bus_recover();
+                }
+            } else {
+                s_mpu_fail_count = 0;
+                if (!s_mpu_logged_first) {
+                    s_mpu_logged_first = true;
+                    ESP_LOGI(TAG,
+                             "MPU6050 first read ax=%.2f ay=%.2f az=%.2f gx=%.2f gy=%.2f gz=%.2f temp=%.2f",
+                             ax, ay, az, gx, gy, gz, temp_c);
+                }
+                if (now - last_ok_log_ms >= 1000) {
+                    last_ok_log_ms = now;
+                    ESP_LOGI(TAG, "MPU6050 ok ax=%.2f ay=%.2f az=%.2f gx=%.2f gy=%.2f gz=%.2f",
+                             ax, ay, az, gx, gy, gz);
+                }
             }
         }
 
@@ -499,9 +752,20 @@ void sensors_init(void)
     sensor_data_set_chip_info(s_chip_model, s_chip_revision, s_chip_cores);
     sensor_data_set_mac(s_mac_str);
 
-    esp_err_t i2c_err = i2c_master_init();
+    if (!s_i2c_mutex) {
+        s_i2c_mutex = xSemaphoreCreateMutex();
+        if (!s_i2c_mutex) {
+            ESP_LOGE(TAG, "I2C mutex create failed");
+        }
+    }
+
+    i2c_log_lines("startup");
+    i2c_gpio_recover();
+
+    esp_err_t i2c_err = i2c_master_init_any();
     if (i2c_err != ESP_OK) {
         ESP_LOGE(TAG, "I2C init failed: %s", esp_err_to_name(i2c_err));
+        s_mpu_present = false;
     } else {
         s_mpu_ready = mpu6050_init();
         s_mpu_last_init_ms = now_ms();
@@ -527,7 +791,11 @@ void sensors_start(void)
     xTaskCreate(ds18b20_task, "ds18b20_task", TASK_STACK_SIZE, NULL, 5, &s_ds18b20_task);
     xTaskCreate(dht11_task, "dht11_task", TASK_STACK_SIZE, NULL, 5, &s_dht11_task);
     xTaskCreate(ultrasonic_task, "ultrasonic_task", TASK_STACK_SIZE, NULL, 5, &s_ultrasonic_task);
-    xTaskCreate(mpu6050_task, "mpu6050_task", TASK_STACK_SIZE, NULL, 5, &s_mpu_task);
+    if (s_mpu_present) {
+        xTaskCreate(mpu6050_task, "mpu6050_task", TASK_STACK_SIZE, NULL, 5, &s_mpu_task);
+    } else {
+        ESP_LOGW(TAG, "MPU6050 not detected; skipping MPU task");
+    }
     xTaskCreate(system_task, "system_task", TASK_STACK_SIZE, NULL, 5, &s_system_task);
 
     s_started = true;
